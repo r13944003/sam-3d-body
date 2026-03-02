@@ -2,6 +2,9 @@
 import argparse
 import os
 from glob import glob
+from concurrent.futures import ThreadPoolExecutor
+import time
+import pickle
 
 import pyrootutils
 
@@ -16,44 +19,60 @@ import cv2
 import numpy as np
 import torch
 from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
-from tools.vis_utils import visualize_sample, visualize_sample_together
+from tools.vis_utils import visualize_sample_together
 from tqdm import tqdm
-import pickle
+
+
+def _imread_bgr(path: str):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"cv2.imread failed: {path}")
+    return img
+
 
 def main(args):
-    # --- keep original output_folder behavior as much as possible ---
-    # If user does not provide --output_folder, we will output to ./output/<subfolder_name> per each subfolder.
     base_output_folder = args.output_folder  # may be ""
 
-    # Use command-line args or environment variables
+    # env fallback
     mhr_path = args.mhr_path or os.environ.get("SAM3D_MHR_PATH", "")
     detector_path = args.detector_path or os.environ.get("SAM3D_DETECTOR_PATH", "")
     segmentor_path = args.segmentor_path or os.environ.get("SAM3D_SEGMENTOR_PATH", "")
     fov_path = args.fov_path or os.environ.get("SAM3D_FOV_PATH", "")
 
-    # Initialize sam-3d-body model and other optional modules
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model, model_cfg = load_sam_3d_body(
-        args.checkpoint_path, device=device, mhr_path=mhr_path
-    )
+
+    # -------- perf knobs (GPU) --------
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    amp_dtype = None
+    if args.amp == "fp16":
+        amp_dtype = torch.float16
+    elif args.amp == "bf16":
+        amp_dtype = torch.bfloat16
+    elif args.amp == "none":
+        amp_dtype = None
+    else:
+        raise ValueError(f"Unknown amp: {args.amp}")
+
+    # -------- load models once --------
+    model, model_cfg = load_sam_3d_body(args.checkpoint_path, device=device, mhr_path=mhr_path)
 
     human_detector, human_segmentor, fov_estimator = None, None, None
     if args.detector_name:
         from tools.build_detector import HumanDetector
-
-        human_detector = HumanDetector(
-            name=args.detector_name, device=device, path=detector_path
-        )
+        human_detector = HumanDetector(name=args.detector_name, device=device, path=detector_path)
 
     if (args.segmentor_name == "sam2" and len(segmentor_path)) or args.segmentor_name != "sam2":
         from tools.build_sam import HumanSegmentor
+        human_segmentor = HumanSegmentor(name=args.segmentor_name, device=device, path=segmentor_path)
 
-        human_segmentor = HumanSegmentor(
-            name=args.segmentor_name, device=device, path=segmentor_path
-        )
     if args.fov_name:
         from tools.build_fov_estimator import FOVEstimator
-
         fov_estimator = FOVEstimator(name=args.fov_name, device=device, path=fov_path)
 
     estimator = SAM3DBodyEstimator(
@@ -64,177 +83,170 @@ def main(args):
         fov_estimator=fov_estimator,
     )
 
-    image_extensions = [
-        "*.jpg",
-        "*.jpeg",
-        "*.png",
-        "*.gif",
-        "*.bmp",
-        "*.tiff",
-        "*.webp",
-    ]
+    image_extensions = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp"]
 
-    # =========================
-    # Minimal change starts here
-    # =========================
-    # args.image_folder is now AIST++/images
-    # We iterate every direct subfolder under it, and read <subfolder>/images/*.{ext}
-    subfolders = sorted(
-        [p for p in glob(os.path.join(args.image_folder, "*")) if os.path.isdir(p)]
-    )
+    # iterate direct subfolders under args.image_folder
+    subfolders = sorted([p for p in glob(os.path.join(args.image_folder, "*")) if os.path.isdir(p)])
 
-    for subfolder in subfolders:
-        images_dir = os.path.join(subfolder, "images")
-        if not os.path.isdir(images_dir):
-            continue
+    # async saver
+    saver = ThreadPoolExecutor(max_workers=args.save_workers) if args.async_save else None
 
-        images_list = sorted(
-            [
-                image
-                for ext in image_extensions
-                for image in glob(os.path.join(images_dir, ext))
-            ]
-        )
-        if len(images_list) == 0:
-            continue
-
-        subfolder_name = os.path.basename(subfolder)
-
-        if base_output_folder == "":
-            output_folder = os.path.join("./output", subfolder_name)
+    def submit_imwrite(path: str, img: np.ndarray):
+        if args.no_save:
+            return
+        if saver is None:
+            cv2.imwrite(path, img)
         else:
-            output_folder = os.path.join(base_output_folder, subfolder_name)
+            saver.submit(cv2.imwrite, path, img)
 
-        os.makedirs(output_folder, exist_ok=True)
+    def write_done_marker(folder: str):
+        if args.write_done:
+            with open(os.path.join(folder, "_DONE"), "w", encoding="utf-8") as f:
+                f.write("done\n")
 
-        for image_path in tqdm(images_list):
-            outputs = estimator.process_one_image(
-                image_path,
-                bbox_thr=args.bbox_thresh,
-                use_mask=args.use_mask,
-            )
+    total_start = time.time()
+    processed_images = 0
+    skipped_images = 0
 
-            img = cv2.imread(image_path)
-
-            # (A) 永遠先存 estimator all outputs（就算是空的也存，方便你之後統計失敗率）
-            base = os.path.splitext(os.path.basename(image_path))[0]
-            out_pkl = os.path.join(output_folder, f"{base}.pkl")
-            with open(out_pkl, "wb") as f:
-                pickle.dump(
-                    {
-                        "image_path": image_path,
-                        "outputs": outputs,          # list[dict] or []
-                    },
-                    f,
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                )
-
-            # (B) 若沒偵測到 box：不要 visualize_sample_together，避免 crash
-            if outputs is None or len(outputs) == 0:
-                # 你可以選擇：
-                # 1) 直接跳過
-                # continue
-
-                # 2) 或是把原圖另存（比較好 debug）
-                cv2.imwrite(os.path.join(output_folder, f"{base}_no_det.jpg"), img)
+    with torch.inference_mode():
+        for subfolder in subfolders:
+            images_dir = os.path.join(subfolder, "images")
+            if not os.path.isdir(images_dir):
                 continue
 
-            # (C) 正常情況才做渲染圖
-            rend_img = visualize_sample_together(img, outputs, estimator.faces)
-            cv2.imwrite(
-                os.path.join(output_folder, f"{base}.jpg"),
-                rend_img.astype(np.uint8),
-            )
-    
+            subfolder_name = os.path.basename(subfolder)
+            if base_output_folder == "":
+                output_folder = os.path.join("./output", subfolder_name)
+            else:
+                output_folder = os.path.join(base_output_folder, subfolder_name)
+            os.makedirs(output_folder, exist_ok=True)
+
+            # folder-level resume
+            done_path = os.path.join(output_folder, "_DONE")
+            if args.resume_folder and os.path.isfile(done_path):
+                if args.verbose:
+                    print(f"[SKIP FOLDER] {subfolder_name} (found _DONE)")
+                continue
+
+            images_list = sorted([img for ext in image_extensions for img in glob(os.path.join(images_dir, ext))])
+            if args.limit > 0:
+                images_list = images_list[: args.limit]
+            if len(images_list) == 0:
+                continue
+
+            pbar = tqdm(images_list, desc=f"{subfolder_name}", leave=True)
+
+            for image_path in pbar:
+                base = os.path.splitext(os.path.basename(image_path))[0]
+                out_pkl = os.path.join(output_folder, f"{base}.pkl")
+                out_jpg = os.path.join(output_folder, f"{base}.jpg")
+                out_no_det = os.path.join(output_folder, f"{base}_no_det.jpg")
+
+                # image-level resume: if pkl exists, consider processed
+                if args.resume_image and os.path.isfile(out_pkl):
+                    skipped_images += 1
+                    continue
+
+                # read image once (for visualization / debug saving)
+                img = None
+                if (not args.no_vis) or (not args.no_save):
+                    try:
+                        img = _imread_bgr(image_path)
+                    except Exception:
+                        # even if read fails, still write pkl with error info
+                        with open(out_pkl, "wb") as f:
+                            pickle.dump({"image_path": image_path, "outputs": None, "error": "imread_failed"}, f,
+                                        protocol=pickle.HIGHEST_PROTOCOL)
+                        processed_images += 1
+                        continue
+
+                # inference (try passing ndarray if estimator supports; else fallback to path)
+                if amp_dtype is not None and device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        try:
+                            outputs = estimator.process_one_image(img, bbox_thr=args.bbox_thresh, use_mask=args.use_mask)
+                        except Exception:
+                            outputs = estimator.process_one_image(image_path, bbox_thr=args.bbox_thresh, use_mask=args.use_mask)
+                else:
+                    try:
+                        outputs = estimator.process_one_image(img, bbox_thr=args.bbox_thresh, use_mask=args.use_mask)
+                    except Exception:
+                        outputs = estimator.process_one_image(image_path, bbox_thr=args.bbox_thresh, use_mask=args.use_mask)
+
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+
+                # always save pkl (even empty outputs)
+                with open(out_pkl, "wb") as f:
+                    pickle.dump({"image_path": image_path, "outputs": outputs}, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                # no detection -> optional debug save
+                if outputs is None or len(outputs) == 0:
+                    if (not args.no_save) and (img is not None) and args.save_no_det:
+                        submit_imwrite(out_no_det, img)
+                    processed_images += 1
+                    continue
+
+                # visualization (CPU heavy) + save
+                if not args.no_vis:
+                    rend_img = visualize_sample_together(img, outputs, estimator.faces).astype(np.uint8)
+                    if not args.no_save:
+                        submit_imwrite(out_jpg, rend_img)
+
+                processed_images += 1
+
+            # mark folder done
+            write_done_marker(output_folder)
+
+    if saver is not None:
+        saver.shutdown(wait=True)
+
+    total_time = time.time() - total_start
+    print("\n=== Summary ===")
+    print(f"processed_images: {processed_images}")
+    print(f"skipped_images:   {skipped_images}")
+    print(f"total_time:       {total_time:.2f}s")
+    if processed_images > 0:
+        print(f"throughput:       {processed_images/total_time:.2f} img/s (processed only)")
+    print("===============\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SAM 3D Body Demo - Single Image Human Mesh Recovery",
+        description="SAM 3D Body Demo - GPU-optimized + Resume",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-                Examples:
-                python demo.py --image_folder ./images --checkpoint_path ./checkpoints/model.ckpt
+    )
+    parser.add_argument("--image_folder", required=True, type=str, help="Path to folder containing input subfolders")
+    parser.add_argument("--output_folder", default="", type=str, help="Base output folder (default ./output/<subfolder>)")
+    parser.add_argument("--checkpoint_path", default="./checkpoints/sam-3d-body-dinov3/model.ckpt", type=str)
 
-                Environment Variables:
-                SAM3D_MHR_PATH: Path to MHR asset
-                SAM3D_DETECTOR_PATH: Path to human detection model folder
-                SAM3D_SEGMENTOR_PATH: Path to human segmentation model folder
-                SAM3D_FOV_PATH: Path to fov estimation model folder
-                """,
-    )
-    parser.add_argument(
-        "--image_folder",
-        required=True,
-        type=str,
-        help="Path to folder containing input images",
-    )
-    parser.add_argument(
-        "--output_folder",
-        default="",
-        type=str,
-        help="Path to output folder (default: ./output/<image_folder_name>)",
-    )
-    parser.add_argument(
-        "--checkpoint_path",
-        default="./checkpoints/sam-3d-body-dinov3/model.ckpt",
-        type=str,
-        help="Path to SAM 3D Body model checkpoint",
-    )
-    parser.add_argument(
-        "--detector_name",
-        default="vitdet",
-        type=str,
-        help="Human detection model for demo (Default `vitdet`, add your favorite detector if needed).",
-    )
-    parser.add_argument(
-        "--segmentor_name",
-        default="sam2",
-        type=str,
-        help="Human segmentation model for demo (Default `sam2`, add your favorite segmentor if needed).",
-    )
-    parser.add_argument(
-        "--fov_name",
-        default="moge2",
-        type=str,
-        help="FOV estimation model for demo (Default `moge2`, add your favorite fov estimator if needed).",
-    )
-    parser.add_argument(
-        "--detector_path",
-        default="",
-        type=str,
-        help="Path to human detection model folder (or set SAM3D_DETECTOR_PATH)",
-    )
-    parser.add_argument(
-        "--segmentor_path",
-        default="",
-        type=str,
-        help="Path to human segmentation model folder (or set SAM3D_SEGMENTOR_PATH)",
-    )
-    parser.add_argument(
-        "--fov_path",
-        default="",
-        type=str,
-        help="Path to fov estimation model folder (or set SAM3D_FOV_PATH)",
-    )
-    parser.add_argument(
-        "--mhr_path",
-        default="./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt",
-        type=str,
-        help="Path to MoHR/assets folder (or set SAM3D_mhr_path)",
-    )
-    parser.add_argument(
-        "--bbox_thresh",
-        default=0.8,
-        type=float,
-        help="Bounding box detection threshold",
-    )
-    parser.add_argument(
-        "--use_mask",
-        action="store_true",
-        default=False,
-        help="Use mask-conditioned prediction (segmentation mask is automatically generated from bbox)",
-    )
+    parser.add_argument("--detector_name", default="vitdet", type=str)
+    parser.add_argument("--segmentor_name", default="sam2", type=str)
+    parser.add_argument("--fov_name", default="moge2", type=str)
+
+    parser.add_argument("--detector_path", default="", type=str)
+    parser.add_argument("--segmentor_path", default="", type=str)
+    parser.add_argument("--fov_path", default="", type=str)
+    parser.add_argument("--mhr_path", default="./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt", type=str)
+
+    parser.add_argument("--bbox_thresh", default=0.8, type=float)
+    parser.add_argument("--use_mask", action="store_true", default=False)
+
+    # perf / workflow
+    parser.add_argument("--amp", default="fp16", choices=["none", "fp16", "bf16"], help="Use Tensor Cores on 3090/4090")
+    parser.add_argument("--no_vis", action="store_true", help="Disable visualization (CPU heavy)")
+    parser.add_argument("--no_save", action="store_true", help="Disable saving images (I/O heavy)")
+    parser.add_argument("--async_save", action="store_true", help="Save images with background threads")
+    parser.add_argument("--save_workers", type=int, default=4)
+
+    # resume
+    parser.add_argument("--resume_folder", action="store_true", help="Skip subfolder if output has _DONE")
+    parser.add_argument("--resume_image", action="store_true", help="Skip image if <base>.pkl exists")
+    parser.add_argument("--write_done", action="store_true", help="Write _DONE after finishing each subfolder")
+    parser.add_argument("--save_no_det", action="store_true", help="Save <base>_no_det.jpg for empty outputs")
+
+    parser.add_argument("--limit", type=int, default=0, help="Limit images per subfolder for quick tests")
+    parser.add_argument("--verbose", action="store_true")
+
     args = parser.parse_args()
-
     main(args)
